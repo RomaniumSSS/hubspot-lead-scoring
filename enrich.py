@@ -5,6 +5,10 @@ knowing HOW enrichment happens. Today it scrapes the company homepage; to switch
 to a vendor API later, replace the body of enrich() — callers stay unchanged.
 """
 
+import ipaddress
+import re
+import socket
+
 import httpx
 from bs4 import BeautifulSoup
 
@@ -24,6 +28,29 @@ FREE_EMAIL_DOMAINS = {
 }
 
 
+# Domains come from contact emails — attacker-controlled once this runs as a
+# webhook service. Guard against SSRF: only fetch real public hostnames, never
+# IP literals or hosts resolving into private/reserved ranges (cloud metadata etc.).
+HOSTNAME_RE = re.compile(
+    r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$"
+)
+MAX_REDIRECTS = 3
+
+
+def is_safe_public_host(host: str) -> bool:
+    """True only for a well-formed public hostname resolving to public IPs."""
+    if not HOSTNAME_RE.match(host):
+        return False
+    try:
+        addr_infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False
+    for info in addr_infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            return False
+    return True
+
+
 def domain_from_email(email: str | None) -> str | None:
     """'john@acmecorp.com' -> 'acmecorp.com'. Returns None if no usable domain."""
     if not email or "@" not in email:
@@ -35,9 +62,9 @@ def enrich(domain: str | None) -> dict:
     """Return company signals for a domain.
 
     Always returns a dict with a 'status' key so the caller can react:
-      - 'skipped'     : free email / no domain — not a company
+      - 'skipped'     : free email, no domain, or unsafe/unresolvable host
       - 'ok'          : reached the site, carries 'title' and 'description'
-      - 'unreachable' : domain exists but the site didn't respond
+      - 'unreachable' : host is fine but the site didn't respond
     """
     if not domain:
         return {"status": "skipped", "note": "no domain"}
@@ -47,13 +74,32 @@ def enrich(domain: str | None) -> dict:
             "note": "free email provider, not a company domain",
         }
 
+    if not is_safe_public_host(domain):
+        return {"status": "skipped", "note": "invalid or non-public domain"}
+
+    # Redirects followed by hand so every hop passes the same SSRF check —
+    # a public site redirecting to an internal address must not be fetched.
+    url = f"https://{domain}"
+    redirects = 0
     try:
-        response = httpx.get(
-            f"https://{domain}",
-            follow_redirects=True,
-            timeout=8.0,
-            headers={"User-Agent": "Mozilla/5.0 (lead-scoring-bot)"},
-        )
+        while True:
+            response = httpx.get(
+                url,
+                follow_redirects=False,
+                timeout=8.0,
+                headers={"User-Agent": "Mozilla/5.0 (lead-scoring-bot)"},
+            )
+            if not response.is_redirect or response.next_request is None:
+                break
+            if redirects >= MAX_REDIRECTS:
+                return {"status": "unreachable", "note": "too many redirects"}
+            redirects += 1
+            next_url = response.next_request.url
+            if next_url.scheme not in ("http", "https") or not is_safe_public_host(
+                next_url.host
+            ):
+                return {"status": "skipped", "note": "redirect to unsafe location"}
+            url = str(next_url)
         response.raise_for_status()
     except httpx.HTTPError as error:
         # A dead company site is expected, not a bug — report it, don't crash the run.
