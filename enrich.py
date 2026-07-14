@@ -38,7 +38,12 @@ MAX_REDIRECTS = 3
 
 
 def is_safe_public_host(host: str) -> bool:
-    """True only for a well-formed public hostname resolving to public IPs."""
+    """True only for a well-formed public hostname resolving to public IPs.
+
+    Residual risk: DNS rebinding (host resolves public here, private on the
+    actual fetch). Acceptable for local runs; revisit with pinned-IP connects
+    before deploying as an internet-facing service (Step 5).
+    """
     if not HOSTNAME_RE.match(host):
         return False
     try:
@@ -110,7 +115,12 @@ def enrich(domain: str | None) -> dict:
     meta = soup.find("meta", attrs={"name": "description"})
     description = meta.get("content", "").strip() if meta else None
 
-    return {"status": "ok", "title": title, "description": description}
+    # Site text is untrusted input headed for an LLM prompt — cap its size.
+    return {
+        "status": "ok",
+        "title": title[:200] if title else None,
+        "description": description[:400] if description else None,
+    }
 
 
 if __name__ == "__main__":
